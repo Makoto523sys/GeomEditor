@@ -1,4 +1,4 @@
-// Dependency-free orthographic CAD viewport. Only exact B-rep edges are drawn.
+// Dependency-free orthographic CAD viewport. CAD edges and independent construction references are drawn.
 const dot=(a,b)=>a.reduce((s,v,i)=>s+v*b[i],0);
 const sub=(a,b)=>a.map((v,i)=>v-b[i]);
 const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
@@ -10,7 +10,7 @@ export class Viewer {
     this.canvas=canvas;this.onPick=onPick;this.gl=canvas.getContext('webgl',{antialias:true,alpha:false,preserveDrawingBuffer:true});
     if(!this.gl)throw Error('WebGL を利用できません。ブラウザーのハードウェアアクセラレーションを確認してください。');
     const gl=this.gl;
-    const vs=`attribute vec3 position;attribute vec3 normal;uniform vec3 right;uniform vec3 up;uniform vec3 direction;uniform vec3 center;uniform vec2 scale;uniform float depthScale;uniform float bias;varying vec3 n;void main(){vec3 p=position-center;gl_Position=vec4(dot(p,right)*scale.x,dot(p,up)*scale.y,-dot(p,direction)/depthScale+bias,1.);n=normal;}`;
+    const vs=`attribute vec3 position;attribute vec3 normal;uniform vec3 right;uniform vec3 up;uniform vec3 direction;uniform vec3 center;uniform vec2 scale;uniform float depthScale;uniform float bias;varying vec3 n;void main(){vec3 p=position-center;gl_Position=vec4(dot(p,right)*scale.x,dot(p,up)*scale.y,-dot(p,direction)/depthScale+bias,1.);n=normal;gl_PointSize=10.;}`;
     const fs=`precision mediump float;uniform vec4 color;uniform float lit;varying vec3 n;void main(){float light=0.72+0.28*abs(dot(normalize(n+vec3(0.0001)),normalize(vec3(0.4,-0.5,0.8))));gl_FragColor=vec4(color.rgb*mix(1.,light,lit),color.a);}`;
     const shader=(type,src)=>{const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s};
     this.program=gl.createProgram();gl.attachShader(this.program,shader(gl.VERTEX_SHADER,vs));gl.attachShader(this.program,shader(gl.FRAGMENT_SHADER,fs));gl.linkProgram(this.program);
@@ -33,6 +33,8 @@ export class Viewer {
   setScene(data,fit=false){const gl=this.gl;for(const item of this.items)gl.deleteBuffer(item.buffer);this.items=[];this.data=data;
     data.faces.forEach(f=>{const pts=[],ns=[];for(const tri of f.triangles){const [a,b,c]=tri.map(i=>f.vertices[i]),n=unit(cross(sub(b,a),sub(c,a)));pts.push(a,b,c);ns.push(n,n,n)}this.items.push(this.buffer(pts,ns,gl.TRIANGLES,{id:f.id,body:f.body,face:true}))});
     data.edges.forEach(e=>{const pts=[];for(let i=1;i<e.points.length;i++)pts.push(e.points[i-1],e.points[i]);this.items.push(this.buffer(pts,null,gl.LINES,{id:e.id,body:e.body,face:false,state:e.state}))});
+    for(const n of data.nodes||[])this.items.push(this.buffer([n.point],null,gl.POINTS,{id:n.id,reference:true,node:true}));
+    for(const l of data.lines||[])this.items.push(this.buffer(l.points,null,gl.LINES,{id:l.id,reference:true}));
     if(fit)this.fit();else this.draw();
   }
   fit(){const b=this.data?.bounds;if(b?.length){const min=[0,1,2].map(i=>Math.min(...b.map(p=>p[i]))),max=[0,1,2].map(i=>Math.max(...b.map(p=>p[i])));this.center=min.map((v,i)=>(v+max[i])/2);this.radius=Math.max(Math.hypot(...sub(max,min))*.62,1)}this.zoom=Math.min(1,this.canvas.clientWidth/this.canvas.clientHeight);this.draw()}
@@ -42,12 +44,22 @@ export class Viewer {
     const b=this.basis(),l=this.locations;gl.uniform3fv(l.right,b.r);gl.uniform3fv(l.up,b.u);gl.uniform3fv(l.direction,b.d);gl.uniform3fv(l.center,this.center);gl.uniform2f(l.scale,this.zoom/this.radius*h/w,this.zoom/this.radius);gl.uniform1f(l.depthScale,this.radius*20);gl.uniform1f(l.bias,0);
     const render=(item,color,lit,bias=0)=>{gl.bindBuffer(gl.ARRAY_BUFFER,item.buffer);gl.enableVertexAttribArray(this.pos);gl.enableVertexAttribArray(this.norm);gl.vertexAttribPointer(this.pos,3,gl.FLOAT,false,24,0);gl.vertexAttribPointer(this.norm,3,gl.FLOAT,false,24,12);gl.uniform4fv(l.color,color);gl.uniform1f(l.lit,lit);gl.uniform1f(l.bias,bias);gl.drawArrays(item.mode,0,item.count)};
     for(const item of this.items){if(this.hidden.has(item.body)||(!item.face)||this.wireOnly)continue;const idx=this.data.bodies.findIndex(b=>b.id===item.body),sel=this.selected.has(item.id)||this.selected.has(item.body);render(item,[...rgb(sel?'#dfb879':colors[idx%colors.length]),1],1)}
-    for(const item of this.items){if(this.hidden.has(item.body)||item.face)continue;const sel=this.selected.has(item.id),palette={free:'#d25b55',shared:'#277f77',nonmanifold:'#b28a19',seam:'#7896a8',wire:'#7c67b0'};render(item,[...rgb(sel?'#f14934':this.topology?palette[item.state]:'#394e5c'),1],0,-.0001)}
+    for(const item of this.items){if(this.hidden.has(item.body)||item.face||item.reference)continue;const sel=this.selected.has(item.id),palette={free:'#d25b55',shared:'#277f77',nonmanifold:'#b28a19',seam:'#7896a8',wire:'#7c67b0'};render(item,[...rgb(sel?'#f14934':this.topology?palette[item.state]:'#394e5c'),1],0,-.0001)}
+    gl.disable(gl.DEPTH_TEST);
+    for(const item of this.items){if(item.reference)render(item,[...rgb(this.selected.has(item.id)?'#f14934':'#8560b6'),1],0)}
+    gl.enable(gl.DEPTH_TEST);
     if(this.plane){gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);render(this.plane,[.05,.62,.72,.18],0);gl.depthMask(true);gl.disable(gl.BLEND)}
     if(this.onView)this.onView({basis:b,span:2*this.radius/this.zoom});
   }
   project(point){const p=sub(point,this.center),b=this.basis(),s=this.canvas.clientHeight*this.zoom/this.radius/2;return[this.canvas.clientWidth/2+dot(p,b.r)*s,this.canvas.clientHeight/2-dot(p,b.u)*s,dot(p,b.d)]}
-  pick(x,y,multi){if(!this.data)return;let faceHit=null,edgeHit=null;
+  pick(x,y,multi){if(!this.data)return;
+    if(this.mode==='node'||this.mode==='line'){
+      let hit=null;
+      if(this.mode==='node')for(const n of this.data.nodes||[]){const p=this.project(n.point),dist=Math.hypot(x-p[0],y-p[1]);if(dist<=10&&(!hit||dist<hit.dist))hit={id:n.id,point:n.point,exact:true,dist}}
+      else for(const l of this.data.lines||[]){const [p,q]=l.points,a=this.project(p),b=this.project(q),dx=b[0]-a[0],dy=b[1]-a[1],length=dx*dx+dy*dy,t=length?Math.max(0,Math.min(1,((x-a[0])*dx+(y-a[1])*dy)/length)):0,dist=Math.hypot(x-a[0]-t*dx,y-a[1]-t*dy);if(dist<=7&&(!hit||dist<hit.dist))hit={id:l.id,point:p.map((v,i)=>v+t*(q[i]-v)),exact:true,dist}}
+      this.onPick(hit,multi);return;
+    }
+    let faceHit=null,edgeHit=null;
     for(const f of this.data.faces){if(this.hidden.has(f.body))continue;const points=f.vertices.map(p=>this.project(p));for(const tri of f.triangles){const [a,b,c]=tri.map(i=>points[i]),den=(b[1]-c[1])*(a[0]-c[0])+(c[0]-b[0])*(a[1]-c[1]);if(Math.abs(den)<1e-12)continue;const u=((b[1]-c[1])*(x-c[0])+(c[0]-b[0])*(y-c[1]))/den,v=((c[1]-a[1])*(x-c[0])+(a[0]-c[0])*(y-c[1]))/den,w=1-u-v;if(u>=0&&v>=0&&w>=0){const depth=u*a[2]+v*b[2]+w*c[2];if(!faceHit||depth>faceHit.depth){const point=[0,1,2].map(j=>u*f.vertices[tri[0]][j]+v*f.vertices[tri[1]][j]+w*f.vertices[tri[2]][j]);faceHit={id:this.mode==='body'?f.body:f.id,depth,point,exact:false}}}}}
     for(const edge of this.data.edges){if(this.hidden.has(edge.body))continue;for(let i=1;i<edge.points.length;i++){const p=edge.points[i-1],q=edge.points[i],a=this.project(p),b=this.project(q),dx=b[0]-a[0],dy=b[1]-a[1],len=dx*dx+dy*dy;const t=len?Math.max(0,Math.min(1,((x-a[0])*dx+(y-a[1])*dy)/len)):0;const dist=Math.hypot(x-a[0]-t*dx,y-a[1]-t*dy),depth=a[2]+t*(b[2]-a[2]);if(dist<7&&(this.wireOnly||!faceHit||depth>=faceHit.depth-this.radius*.002)&&(!edgeHit||dist<edgeHit.dist)){let point=p.map((v,j)=>v+t*(q[j]-v)),exact=edge.type==='LINE';if(i===1&&Math.hypot(x-a[0],y-a[1])<8){point=p;exact=true}else if(i===edge.points.length-1&&Math.hypot(x-b[0],y-b[1])<8){point=q;exact=true}edgeHit={id:edge.id,dist,depth,point,exact}}}}
     const hit=this.mode==='edge'?edgeHit:faceHit;if(hit&&edgeHit&&this.mode!=='edge'){hit.point=edgeHit.point;hit.exact=edgeHit.exact}this.onPick(hit,multi);
