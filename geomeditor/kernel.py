@@ -13,6 +13,8 @@ import cadquery as cq
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter, BRepAlgoAPI_Section, BRepAlgoAPI_Defeaturing
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
 from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+from OCP.GeomAbs import GeomAbs_C0, GeomAbs_G1
 from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.BRepFeat import BRepFeat_SplitShape
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
@@ -177,6 +179,48 @@ class Document:
                 raise GeometryError('ラインには存在する2つの仮想節点が必要です。')
             if (positions[ends[1]]-positions[ends[0]]).Length <= 1e-7:
                 raise GeometryError('ラインの2節点は 1e-7 mm より離してください。')
+
+    def perpendicular_line(self, p):
+        node = next((n for n in self.nodes if n['id'] == p.get('node')), None)
+        if node is None:
+            raise GeometryError('始点となる仮想節点を1つ選択してください。')
+        _, edge = self.entity(p.get('edge'), 'E')
+        origin = vector(node['point'])
+        curve = BRepAdaptor_Curve(edge.wrapped)
+        if edge.Length() <= 1e-7 or curve.Continuity() in (GeomAbs_C0, GeomAbs_G1):
+            raise GeometryError('長さが極小、または接線が不連続なエッジには垂線を作成できません。')
+        # Apply the edge location: projected points and tangents must be in world coordinates.
+        geom = curve.Curve().Curve().Transformed(curve.Trsf())
+        if edge.geomType() == 'CIRCLE':
+            circle = curve.Circle()
+            radial = origin - cq.Vector(circle.Location())
+            axis = cq.Vector(circle.Axis().Direction())
+            if radial.cross(axis).Length <= 1e-7:
+                raise GeometryError('円弧の軸上では垂線の足が一意に定まりません。始点を変更してください。')
+        projection = GeomAPI_ProjectPointOnCurve(origin.toPnt(), geom, curve.FirstParameter(), curve.LastParameter())
+        parameters = [curve.FirstParameter(), curve.LastParameter()]
+        parameters.extend(projection.Parameter(i) for i in range(1, projection.NbPoints()+1))
+        if projection.NbPoints() == 0 and edge.geomType() != 'LINE':
+            raise GeometryError('この曲線上の垂線の足を求められませんでした。')
+        candidates = sorted(((origin-cq.Vector(curve.Value(u))).Length, u) for u in parameters)
+        distance, param = candidates[0]
+        foot = cq.Vector(curve.Value(param))
+        if distance <= 1e-7:
+            raise GeometryError('節点はすでにエッジ上にあります。長さゼロの垂線は作成しません。')
+        for d, u in candidates[1:]:
+            if abs(d-distance) <= 1e-7 and (cq.Vector(curve.Value(u))-foot).Length > 1e-7:
+                raise GeometryError('同じ距離の垂線の足が複数あります。始点またはエッジを変更してください。')
+        tangent = cq.Vector(curve.DN(param, 1))
+        if tangent.Length < 1e-12:
+            raise GeometryError('垂線の足で接線を定義できません。')
+        if abs((origin-foot).dot(tangent.normalized())) > max(1e-7, distance*1e-8):
+            raise GeometryError('エッジ範囲内に垂線の足がありません。端点への斜線は作成しません。')
+        foot_id, line_id = f'N{self.next_node}', f'L{self.next_line}'
+        new_node = {'id': foot_id, 'point': vector(foot.toTuple()).toTuple()}
+        new_line = {'id': line_id, 'nodes': [node['id'], foot_id]}
+        self.commit(self.bodies, f"垂線 {line_id} と垂線の足 {foot_id} を作成（長さ {distance:.8g} mm）", self.nodes+[new_node], self.lines+[new_line])
+        self.next_node += 1
+        self.next_line += 1
 
     def edge_nodes(self, p):
         _, edge = self.entity(p.get('edge'), 'E')
@@ -377,6 +421,9 @@ class Document:
             return
         if action == 'sample':
             self.sample(p.get('name'))
+            return
+        if action == 'perpendicular_line':
+            self.perpendicular_line(p)
             return
         if action in ('node_on_edge', 'nodes_divide_edge'):
             self.edge_nodes(p)
