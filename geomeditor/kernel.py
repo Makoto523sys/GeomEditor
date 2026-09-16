@@ -12,6 +12,8 @@ from pathlib import Path
 import cadquery as cq
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter, BRepAlgoAPI_Section, BRepAlgoAPI_Defeaturing
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.BRepFeat import BRepFeat_SplitShape
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
 from OCP.IFSelect import IFSelect_RetDone
@@ -176,6 +178,50 @@ class Document:
             if (positions[ends[1]]-positions[ends[0]]).Length <= 1e-7:
                 raise GeometryError('ラインの2節点は 1e-7 mm より離してください。')
 
+    def edge_nodes(self, p):
+        _, edge = self.entity(p.get('edge'), 'E')
+        curve = BRepAdaptor_Curve(edge.wrapped)
+        length = GCPnts_AbscissaPoint.Length_s(curve, 1e-9)
+        if not math.isfinite(length) or length <= 1e-7:
+            raise GeometryError('長さが 1e-7 mm 以下のエッジには節点を配置できません。')
+        reverse = p.get('reverse', False)
+        if not isinstance(reverse, bool):
+            raise GeometryError('向きの反転指定が不正です。')
+        if p['action'] == 'nodes_divide_edge':
+            count = number(p.get('divisions'), '分割数')
+            if not count.is_integer() or not 1 <= count <= 1000:
+                raise GeometryError('分割数 n は 1～1000 の整数にしてください。')
+            count = int(count)
+            fractions = [i/count for i in range(count+1)]
+        else:
+            fraction = number(p.get('fraction'), '長さの割合')
+            if not 0 <= fraction <= 1:
+                raise GeometryError('長さの割合は 0～1 で指定してください。')
+            fractions = [fraction]
+        # Integrate and invert physical arc length with explicit absolute tolerance.
+        # Increasing underlying curve parameter defines the displayed 0 -> 1 direction.
+        nodes = []
+        for i, fraction in enumerate(fractions):
+            t = 1-fraction if reverse else fraction
+            if t == 0:
+                param = curve.FirstParameter()
+            elif t == 1:
+                param = curve.LastParameter()
+            else:
+                solver = GCPnts_AbscissaPoint(1e-9, curve, length*t, curve.FirstParameter())
+                if not solver.IsDone():
+                    raise GeometryError('エッジ上の弧長位置を計算できません。節点は作成していません。')
+                param = solver.Parameter()
+                if not curve.FirstParameter() <= param <= curve.LastParameter():
+                    raise GeometryError('エッジ範囲外の計算結果を検出したため中止しました。')
+            point = vector(cq.Vector(curve.Value(param)).toTuple()).toTuple()
+            nodes.append({'id': f'N{self.next_node+i}', 'point': point})
+        label = f"{p['edge']} 上に仮想節点を {len(nodes)} 個作成（弧長基準）"
+        if edge.IsClosed() and len(nodes) > 1:
+            label += '。閉じたエッジの始終点は同じ位置です'
+        self.commit(self.bodies, label, self.nodes + nodes)
+        self.next_node += len(nodes)
+
     def construction_operation(self, p):
         action = p['action']
         nodes, lines = list(self.nodes), list(self.lines)
@@ -331,6 +377,9 @@ class Document:
             return
         if action == 'sample':
             self.sample(p.get('name'))
+            return
+        if action in ('node_on_edge', 'nodes_divide_edge'):
+            self.edge_nodes(p)
             return
         if action in ('node_create', 'node_move', 'line_create', 'construction_delete'):
             self.construction_operation(p)
@@ -615,7 +664,8 @@ class Document:
                 pts, _ = edge.sample(2 if edge.geomType() == 'LINE' else 64)
                 if edge.IsClosed() and pts and (pts[0]-pts[-1]).Length > 1e-10:
                     pts.append(pts[0])
-                edges_out.append({'id':f'{body.id}:E{i+1}', 'body':body.id, 'type':edge.geomType(), 'length':edge.Length(), 'state':state, 'faces':owners, 'points':[v.toTuple() for v in pts]})
+                curve = BRepAdaptor_Curve(edge.wrapped)
+                edges_out.append({'id':f'{body.id}:E{i+1}', 'body':body.id, 'type':edge.geomType(), 'length':GCPnts_AbscissaPoint.Length_s(curve, 1e-9), 'closed':edge.IsClosed(), 'start':cq.Vector(curve.Value(curve.FirstParameter())).toTuple(), 'end':cq.Vector(curve.Value(curve.LastParameter())).toTuple(), 'state':state, 'faces':owners, 'points':[v.toTuple() for v in pts]})
             bodies.append({'id':body.id, 'name':body.name, 'solids':len(shape.Solids()), 'faces':len(faces), 'edges':len(edges), 'volume':sum(s.Volume() for s in shape.Solids()), 'area':shape.Area(), 'valid':shape.isValid(), 'topology':counts, 'bounds':[[bbox.xmin,bbox.ymin,bbox.zmin],[bbox.xmax,bbox.ymax,bbox.zmax]]})
         bounds.extend(n['point'] for n in self.nodes)
         positions = {n['id']: n['point'] for n in self.nodes}
