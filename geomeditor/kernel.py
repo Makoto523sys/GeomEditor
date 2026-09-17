@@ -12,6 +12,12 @@ from pathlib import Path
 import cadquery as cq
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter, BRepAlgoAPI_Section, BRepAlgoAPI_Defeaturing
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol
+from OCP.gp import gp_Ax1, gp_Dir
+from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+from OCP.GeomAbs import GeomAbs_C0, GeomAbs_G1
+from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.BRepFeat import BRepFeat_SplitShape
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffsetShape
 from OCP.IFSelect import IFSelect_RetDone
@@ -115,6 +121,10 @@ class Body:
 class Document:
     def __init__(self):
         self.bodies: list[Body] = []
+        self.nodes = []
+        self.lines = []
+        self.next_node = 1
+        self.next_line = 1
         self.undo_stack = []
         self.redo_stack = []
         self.log = []
@@ -127,14 +137,18 @@ class Document:
         self.next_id += 1
         return body
 
-    def commit(self, bodies, label):
+    def commit(self, bodies, label, nodes=None, lines=None):
         # Validate the entire transaction before publishing any changed shape.
         for body in bodies:
             checked(body.shape)
-        self.undo_stack.append((self.bodies, self.log))
+        nodes = self.nodes if nodes is None else nodes
+        lines = self.lines if lines is None else lines
+        self.validate_construction(nodes, lines)
+        self.undo_stack.append((self.bodies, self.log, self.nodes, self.lines))
         self.undo_stack = self.undo_stack[-30:]
         self.redo_stack.clear()
         self.bodies = bodies
+        self.nodes, self.lines = nodes, lines
         self.log = self.log + [label]
         self.revision += 1
         self.message = label
@@ -143,10 +157,193 @@ class Document:
         source, dest = (self.undo_stack, self.redo_stack) if direction == 'undo' else (self.redo_stack, self.undo_stack)
         if not source:
             raise GeometryError('これ以上戻せません。' if direction == 'undo' else 'やり直す操作がありません。')
-        dest.append((self.bodies, self.log))
-        self.bodies, self.log = source.pop()
+        dest.append((self.bodies, self.log, self.nodes, self.lines))
+        self.bodies, self.log, self.nodes, self.lines = source.pop()
         self.revision += 1
         self.message = '元に戻しました。' if direction == 'undo' else 'やり直しました。'
+
+    @staticmethod
+    def validate_construction(nodes, lines):
+        positions = {}
+        for node in nodes:
+            key = node['id']
+            if not isinstance(key, str) or not key.startswith('N') or not key[1:].isdigit() or key in positions:
+                raise GeometryError('仮想節点IDが不正または重複しています。')
+            positions[key] = vector(node['point'])
+        seen = set()
+        for line in lines:
+            key = line['id']
+            if not isinstance(key, str) or not key.startswith('L') or not key[1:].isdigit() or key in seen:
+                raise GeometryError('作図ラインIDが不正または重複しています。')
+            seen.add(key)
+            ends = line['nodes']
+            if not isinstance(ends, list) or len(ends) != 2 or any(n not in positions for n in ends):
+                raise GeometryError('ラインには存在する2つの仮想節点が必要です。')
+            if (positions[ends[1]]-positions[ends[0]]).Length <= 1e-7:
+                raise GeometryError('ラインの2節点は 1e-7 mm より離してください。')
+
+    def perpendicular_line(self, p):
+        node = next((n for n in self.nodes if n['id'] == p.get('node')), None)
+        if node is None:
+            raise GeometryError('始点となる仮想節点を1つ選択してください。')
+        _, edge = self.entity(p.get('edge'), 'E')
+        origin = vector(node['point'])
+        curve = BRepAdaptor_Curve(edge.wrapped)
+        if edge.Length() <= 1e-7 or curve.Continuity() in (GeomAbs_C0, GeomAbs_G1):
+            raise GeometryError('長さが極小、または接線が不連続なエッジには垂線を作成できません。')
+        # Apply the edge location: projected points and tangents must be in world coordinates.
+        geom = curve.Curve().Curve().Transformed(curve.Trsf())
+        if edge.geomType() == 'CIRCLE':
+            circle = curve.Circle()
+            radial = origin - cq.Vector(circle.Location())
+            axis = cq.Vector(circle.Axis().Direction())
+            if radial.cross(axis).Length <= 1e-7:
+                raise GeometryError('円弧の軸上では垂線の足が一意に定まりません。始点を変更してください。')
+        projection = GeomAPI_ProjectPointOnCurve(origin.toPnt(), geom, curve.FirstParameter(), curve.LastParameter())
+        parameters = [curve.FirstParameter(), curve.LastParameter()]
+        parameters.extend(projection.Parameter(i) for i in range(1, projection.NbPoints()+1))
+        if projection.NbPoints() == 0 and edge.geomType() != 'LINE':
+            raise GeometryError('この曲線上の垂線の足を求められませんでした。')
+        candidates = sorted(((origin-cq.Vector(curve.Value(u))).Length, u) for u in parameters)
+        distance, param = candidates[0]
+        foot = cq.Vector(curve.Value(param))
+        if distance <= 1e-7:
+            raise GeometryError('節点はすでにエッジ上にあります。長さゼロの垂線は作成しません。')
+        for d, u in candidates[1:]:
+            if abs(d-distance) <= 1e-7 and (cq.Vector(curve.Value(u))-foot).Length > 1e-7:
+                raise GeometryError('同じ距離の垂線の足が複数あります。始点またはエッジを変更してください。')
+        tangent = cq.Vector(curve.DN(param, 1))
+        if tangent.Length < 1e-12:
+            raise GeometryError('垂線の足で接線を定義できません。')
+        if abs((origin-foot).dot(tangent.normalized())) > max(1e-7, distance*1e-8):
+            raise GeometryError('エッジ範囲内に垂線の足がありません。端点への斜線は作成しません。')
+        foot_id, line_id = f'N{self.next_node}', f'L{self.next_line}'
+        new_node = {'id': foot_id, 'point': vector(foot.toTuple()).toTuple()}
+        new_line = {'id': line_id, 'nodes': [node['id'], foot_id]}
+        self.commit(self.bodies, f"垂線 {line_id} と垂線の足 {foot_id} を作成（長さ {distance:.8g} mm）", self.nodes+[new_node], self.lines+[new_line])
+        self.next_node += 1
+        self.next_line += 1
+
+    def revolved_tool(self, p):
+        source = p.get('source')
+        if isinstance(source, str) and source.startswith('L'):
+            line = next((line for line in self.lines if line['id'] == source), None)
+            if line is None:
+                raise GeometryError('回転する作図ラインがありません。')
+            points = {node['id']: node['point'] for node in self.nodes}
+            edge = cq.Edge.makeLine(vector(points[line['nodes'][0]]), vector(points[line['nodes'][1]]))
+        else:
+            _, edge = self.entity(source, 'E')
+        mode = p.get('axis_mode', 'vector')
+        if mode == 'nodes':
+            ids = p.get('axis_nodes', [])
+            points = {node['id']: node['point'] for node in self.nodes}
+            if not isinstance(ids, list) or len(ids) != 2 or any(not isinstance(key, str) or key not in points for key in ids):
+                raise GeometryError('回転軸の2節点を指定してください。')
+            origin = vector(points[ids[0]])
+            direction = vector(points[ids[1]]) - origin
+        elif mode == 'vector':
+            origin = vector(p.get('axis_origin'), '軸上の点')
+            direction = vector(p.get('axis_direction'), '回転軸の方向', True)
+        else:
+            raise GeometryError('回転軸の指定方法が不正です。')
+        if direction.Length <= 1e-7:
+            raise GeometryError('回転軸の2点は 1e-7 mm より離してください。')
+        angle = number(p.get('angle', 360), '回転角度')
+        start = number(p.get('start_angle', 0), '開始角度')
+        if not 0 < abs(angle) <= 360:
+            raise GeometryError('回転角度はゼロを除く -360～360 度で指定してください。')
+        direction = direction.normalized()
+        edge = edge.rotate(origin, origin+direction, start % 360)
+        if angle < 0:
+            direction = direction * -1
+        axis = gp_Ax1(origin.toPnt(), gp_Dir(*direction.toTuple()))
+        op = BRepPrimAPI_MakeRevol(edge.wrapped, axis, math.radians(abs(angle)), True)
+        if not op.IsDone():
+            raise GeometryError('回転面を作成できません。ラインと軸の位置を確認してください。')
+        if op.Shape().IsNull():
+            raise GeometryError('回転で面ができません。軸上のラインは使用できません。')
+        tool = cq.Shape.cast(op.Shape())
+        if not tool.Faces() or tool.Area() <= 1e-12:
+            raise GeometryError('回転で面ができません。軸上のラインは使用できません。')
+        return checked(tool)
+
+    def edge_nodes(self, p):
+        _, edge = self.entity(p.get('edge'), 'E')
+        curve = BRepAdaptor_Curve(edge.wrapped)
+        length = GCPnts_AbscissaPoint.Length_s(curve, 1e-9)
+        if not math.isfinite(length) or length <= 1e-7:
+            raise GeometryError('長さが 1e-7 mm 以下のエッジには節点を配置できません。')
+        reverse = p.get('reverse', False)
+        if not isinstance(reverse, bool):
+            raise GeometryError('向きの反転指定が不正です。')
+        if p['action'] == 'nodes_divide_edge':
+            count = number(p.get('divisions'), '分割数')
+            if not count.is_integer() or not 1 <= count <= 1000:
+                raise GeometryError('分割数 n は 1～1000 の整数にしてください。')
+            count = int(count)
+            fractions = [i/count for i in range(count+1)]
+        else:
+            fraction = number(p.get('fraction'), '長さの割合')
+            if not 0 <= fraction <= 1:
+                raise GeometryError('長さの割合は 0～1 で指定してください。')
+            fractions = [fraction]
+        # Integrate and invert physical arc length with explicit absolute tolerance.
+        # Increasing underlying curve parameter defines the displayed 0 -> 1 direction.
+        nodes = []
+        for i, fraction in enumerate(fractions):
+            t = 1-fraction if reverse else fraction
+            if t == 0:
+                param = curve.FirstParameter()
+            elif t == 1:
+                param = curve.LastParameter()
+            else:
+                solver = GCPnts_AbscissaPoint(1e-9, curve, length*t, curve.FirstParameter())
+                if not solver.IsDone():
+                    raise GeometryError('エッジ上の弧長位置を計算できません。節点は作成していません。')
+                param = solver.Parameter()
+                if not curve.FirstParameter() <= param <= curve.LastParameter():
+                    raise GeometryError('エッジ範囲外の計算結果を検出したため中止しました。')
+            point = vector(cq.Vector(curve.Value(param)).toTuple()).toTuple()
+            nodes.append({'id': f'N{self.next_node+i}', 'point': point})
+        label = f"{p['edge']} 上に仮想節点を {len(nodes)} 個作成（弧長基準）"
+        if edge.IsClosed() and len(nodes) > 1:
+            label += '。閉じたエッジの始終点は同じ位置です'
+        self.commit(self.bodies, label, self.nodes + nodes)
+        self.next_node += len(nodes)
+
+    def construction_operation(self, p):
+        action = p['action']
+        nodes, lines = list(self.nodes), list(self.lines)
+        if action == 'node_create':
+            point = vector(p.get('point')).toTuple()
+            key = f'N{self.next_node}'
+            nodes.append({'id': key, 'point': point})
+            label = f'仮想節点 {key} を作成'
+        elif action == 'node_move':
+            key = p.get('node')
+            if not any(n['id'] == key for n in nodes):
+                raise GeometryError('移動する仮想節点を選択してください。')
+            point = vector(p.get('point')).toTuple()
+            nodes = [dict(n, point=point) if n['id'] == key else n for n in nodes]
+            label = f'仮想節点 {key} を移動（作図ラインのみ追従）'
+        elif action == 'line_create':
+            key = f'L{self.next_line}'
+            lines.append({'id': key, 'nodes': p.get('nodes')})
+            label = f'作図ライン {key} を作成'
+        else:
+            keys = p.get('construction', [])
+            available = {x['id'] for x in nodes + lines}
+            if not keys or any(k not in available for k in keys):
+                raise GeometryError('削除する仮想節点・作図ラインを選択してください。')
+            nodes = [n for n in nodes if n['id'] not in keys]
+            lines = [l for l in lines if l['id'] not in keys and not any(n in keys for n in l['nodes'])]
+            label = '選択した作図要素と接続ラインを削除'
+        self.commit(self.bodies, label, nodes, lines)
+        if action == 'node_create':
+            self.next_node += 1
+        if action == 'line_create':
+            self.next_line += 1
 
     def body(self, key):
         for body in self.bodies:
@@ -214,7 +411,7 @@ class Document:
     def save_project(self):
         out = io.BytesIO()
         with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-            manifest = {'format': 'GeomEditor', 'version': 1, 'unit': 'mm', 'log': self.log, 'bodies': []}
+            manifest = {'format': 'GeomEditor', 'version': 2, 'unit': 'mm', 'log': self.log, 'nodes': self.nodes, 'lines': self.lines, 'bodies': []}
             for i, body in enumerate(self.bodies):
                 buf = io.BytesIO()
                 body.shape.exportBrep(buf)
@@ -230,10 +427,14 @@ class Document:
                 if sum(i.file_size for i in z.infolist()) > 200 * 1024**2:
                     raise GeometryError('展開後のプロジェクトサイズが200 MBを超えています。')
                 m = json.loads(z.read('manifest.json'))
-                if m['format'] != 'GeomEditor' or m['version'] != 1 or m['unit'] != 'mm':
+                if m['format'] != 'GeomEditor' or m['version'] not in (1, 2) or m['unit'] != 'mm':
                     raise GeometryError('未対応のプロジェクト形式です。')
                 bodies = [self.make_body(cq.Shape.importBrep(io.BytesIO(z.read(b['file']))), b['name']) for b in m['bodies']]
-                self.commit(bodies, 'プロジェクトを復元しました。')
+                nodes, lines = m.get('nodes', []), m.get('lines', [])
+                self.validate_construction(nodes, lines)
+                self.commit(bodies, 'プロジェクトを復元しました。', nodes, lines)
+                self.next_node = max(self.next_node, max((int(n['id'][1:])+1 for n in nodes), default=1))
+                self.next_line = max(self.next_line, max((int(l['id'][1:])+1 for l in lines), default=1))
                 self.log = [str(s)[:300] for s in m.get('log', [])][-1000:] + [self.message]
         except (KeyError, zipfile.BadZipFile, json.JSONDecodeError) as e:
             raise GeometryError('プロジェクトを読み込めません。') from e
@@ -267,6 +468,22 @@ class Document:
         if action == 'sample':
             self.sample(p.get('name'))
             return
+        if action == 'perpendicular_line':
+            self.perpendicular_line(p)
+            return
+        if action in ('node_on_edge', 'nodes_divide_edge'):
+            self.edge_nodes(p)
+            return
+        if action in ('node_create', 'node_move', 'line_create', 'construction_delete'):
+            self.construction_operation(p)
+            return
+        if action == 'split_reference':
+            line = next((l for l in self.lines if l['id'] == p.get('line')), None)
+            if line is None:
+                raise GeometryError('分割工具に使う作図ラインを選択してください。')
+            points = {n['id']: n['point'] for n in self.nodes}
+            p = dict(p, action='split_line', origin=points[line['nodes'][0]], end=points[line['nodes'][1]])
+            action = 'split_line'
         ids = list(dict.fromkeys(p.get('bodies', [])))
         selected = [self.body(key) for key in ids]
         tol = number(p.get('tolerance', 1e-6), '許容差', True)
@@ -288,9 +505,11 @@ class Document:
         def add(shape, name):
             new_bodies.append(self.make_body(shape, name))
 
-        if action in ('split_plane', 'split_line', 'split_tool', 'perpendicular', 'parallel'):
+        if action in ('split_plane', 'split_line', 'split_tool', 'split_revolve', 'perpendicular', 'parallel'):
             require_body()
-            if action == 'split_tool':
+            if action == 'split_revolve':
+                tool = self.revolved_tool(p)
+            elif action == 'split_tool':
                 _, tool = self.entity(p.get('tool'), 'F')
             else:
                 origin = vector(p.get('origin', [0, 0, 0]))
@@ -540,6 +759,10 @@ class Document:
                 pts, _ = edge.sample(2 if edge.geomType() == 'LINE' else 64)
                 if edge.IsClosed() and pts and (pts[0]-pts[-1]).Length > 1e-10:
                     pts.append(pts[0])
-                edges_out.append({'id':f'{body.id}:E{i+1}', 'body':body.id, 'type':edge.geomType(), 'length':edge.Length(), 'state':state, 'faces':owners, 'points':[v.toTuple() for v in pts]})
+                curve = BRepAdaptor_Curve(edge.wrapped)
+                edges_out.append({'id':f'{body.id}:E{i+1}', 'body':body.id, 'type':edge.geomType(), 'length':GCPnts_AbscissaPoint.Length_s(curve, 1e-9), 'closed':edge.IsClosed(), 'start':cq.Vector(curve.Value(curve.FirstParameter())).toTuple(), 'end':cq.Vector(curve.Value(curve.LastParameter())).toTuple(), 'state':state, 'faces':owners, 'points':[v.toTuple() for v in pts]})
             bodies.append({'id':body.id, 'name':body.name, 'solids':len(shape.Solids()), 'faces':len(faces), 'edges':len(edges), 'volume':sum(s.Volume() for s in shape.Solids()), 'area':shape.Area(), 'valid':shape.isValid(), 'topology':counts, 'bounds':[[bbox.xmin,bbox.ymin,bbox.zmin],[bbox.xmax,bbox.ymax,bbox.zmax]]})
-        return {'revision':self.revision, 'unit':'mm', 'bodies':bodies, 'faces':faces_out, 'edges':edges_out, 'bounds':bounds, 'undo':bool(self.undo_stack), 'redo':bool(self.redo_stack), 'log':self.log[-50:], 'message':self.message}
+        bounds.extend(n['point'] for n in self.nodes)
+        positions = {n['id']: n['point'] for n in self.nodes}
+        lines = [dict(l, points=[positions[k] for k in l['nodes']], length=(vector(positions[l['nodes'][1]])-vector(positions[l['nodes'][0]])).Length) for l in self.lines]
+        return {'nodes':self.nodes, 'lines':lines, 'revision':self.revision, 'unit':'mm', 'bodies':bodies, 'faces':faces_out, 'edges':edges_out, 'bounds':bounds, 'undo':bool(self.undo_stack), 'redo':bool(self.redo_stack), 'log':self.log[-50:], 'message':self.message}
