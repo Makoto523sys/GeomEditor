@@ -13,6 +13,8 @@ import cadquery as cq
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter, BRepAlgoAPI_Section, BRepAlgoAPI_Defeaturing
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
 from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol
+from OCP.gp import gp_Ax1, gp_Dir
 from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
 from OCP.GeomAbs import GeomAbs_C0, GeomAbs_G1
 from OCP.GCPnts import GCPnts_AbscissaPoint
@@ -221,6 +223,50 @@ class Document:
         self.commit(self.bodies, f"垂線 {line_id} と垂線の足 {foot_id} を作成（長さ {distance:.8g} mm）", self.nodes+[new_node], self.lines+[new_line])
         self.next_node += 1
         self.next_line += 1
+
+    def revolved_tool(self, p):
+        source = p.get('source')
+        if isinstance(source, str) and source.startswith('L'):
+            line = next((line for line in self.lines if line['id'] == source), None)
+            if line is None:
+                raise GeometryError('回転する作図ラインがありません。')
+            points = {node['id']: node['point'] for node in self.nodes}
+            edge = cq.Edge.makeLine(vector(points[line['nodes'][0]]), vector(points[line['nodes'][1]]))
+        else:
+            _, edge = self.entity(source, 'E')
+        mode = p.get('axis_mode', 'vector')
+        if mode == 'nodes':
+            ids = p.get('axis_nodes', [])
+            points = {node['id']: node['point'] for node in self.nodes}
+            if not isinstance(ids, list) or len(ids) != 2 or any(not isinstance(key, str) or key not in points for key in ids):
+                raise GeometryError('回転軸の2節点を指定してください。')
+            origin = vector(points[ids[0]])
+            direction = vector(points[ids[1]]) - origin
+        elif mode == 'vector':
+            origin = vector(p.get('axis_origin'), '軸上の点')
+            direction = vector(p.get('axis_direction'), '回転軸の方向', True)
+        else:
+            raise GeometryError('回転軸の指定方法が不正です。')
+        if direction.Length <= 1e-7:
+            raise GeometryError('回転軸の2点は 1e-7 mm より離してください。')
+        angle = number(p.get('angle', 360), '回転角度')
+        start = number(p.get('start_angle', 0), '開始角度')
+        if not 0 < abs(angle) <= 360:
+            raise GeometryError('回転角度はゼロを除く -360～360 度で指定してください。')
+        direction = direction.normalized()
+        edge = edge.rotate(origin, origin+direction, start % 360)
+        if angle < 0:
+            direction = direction * -1
+        axis = gp_Ax1(origin.toPnt(), gp_Dir(*direction.toTuple()))
+        op = BRepPrimAPI_MakeRevol(edge.wrapped, axis, math.radians(abs(angle)), True)
+        if not op.IsDone():
+            raise GeometryError('回転面を作成できません。ラインと軸の位置を確認してください。')
+        if op.Shape().IsNull():
+            raise GeometryError('回転で面ができません。軸上のラインは使用できません。')
+        tool = cq.Shape.cast(op.Shape())
+        if not tool.Faces() or tool.Area() <= 1e-12:
+            raise GeometryError('回転で面ができません。軸上のラインは使用できません。')
+        return checked(tool)
 
     def edge_nodes(self, p):
         _, edge = self.entity(p.get('edge'), 'E')
@@ -459,9 +505,11 @@ class Document:
         def add(shape, name):
             new_bodies.append(self.make_body(shape, name))
 
-        if action in ('split_plane', 'split_line', 'split_tool', 'perpendicular', 'parallel'):
+        if action in ('split_plane', 'split_line', 'split_tool', 'split_revolve', 'perpendicular', 'parallel'):
             require_body()
-            if action == 'split_tool':
+            if action == 'split_revolve':
+                tool = self.revolved_tool(p)
+            elif action == 'split_tool':
                 _, tool = self.entity(p.get('tool'), 'F')
             else:
                 origin = vector(p.get('origin', [0, 0, 0]))
